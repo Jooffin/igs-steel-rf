@@ -87,7 +87,11 @@ def anchor_parts(spec):
     typ = str(spec.get("type", "1"))
     rod = math.pi * d * d / 4.0 * L
     if typ == "1":
-        rod += math.pi * d * d / 4.0 * hook_leg(spec)
+        # rod below the surface up to the bend centre + the horizontal leg +
+        # the ball corner's extra steel (sphere minus the two half-cylinders
+        # it wraps: net about +1/2 * pi r^3)
+        r = d / 2.0
+        rod += math.pi * r * r * (hook_leg(spec) + 0.5 * r)
     elif typ == "2":
         side, t = plate_dims(spec)
         rod += side * side * t
@@ -101,9 +105,16 @@ def anchor_parts(spec):
 
 
 def hook_leg(spec) -> float:
-    """Horizontal leg length of the type-1 hook (model approximation)."""
+    """Total horizontal leg length of the type-1 hook, measured from the
+    rod axis (model approximation)."""
     d = D_MM[str(spec["size"])] / 1000.0
     return max(4.0 * d, 0.060)
+
+
+def bend_radius(spec) -> float:
+    """Effective centreline radius of the type-1 hook bend: the ball-elbow
+    rounds the corner over one rod radius."""
+    return D_MM[str(spec["size"])] / 2000.0
 
 
 def plate_dims(spec):
@@ -125,13 +136,10 @@ def _hex_pts(sw):
              rr * math.sin(math.pi / 6 + math.pi * i / 3)) for i in range(6)]
 
 
-def anchor_mesh(spec):
-    """Watertight anchor in LOCAL bolt space: the mounting surface is z = 0,
-    the rod runs up to ``z = +e`` (projection) and down to ``z = -(L - e)``.
-    Placement (translation, hook rotation, up/down) lives in the group's
-    xform — the mesh itself is never re-baked."""
+def _anchor_manifold(spec):
+    """The anchor as one manifold3d solid in LOCAL bolt space (see
+    anchor_mesh); split out so QA can probe the solid directly."""
     import manifold3d as m3d
-    from core import solids
 
     mm = str(spec["size"])
     if mm not in D_MM:
@@ -153,14 +161,32 @@ def anchor_mesh(spec):
                                 circular_segments=segs).translate((0.0, 0.0, -Le))
     mans.append(rod)
     if typ == "1":
+        # A proper bent end (ball-elbow capsule): the rod runs straight down
+        # to the bend centre, a sphere of rod radius rounds the corner, and
+        # the horizontal leg leaves that centre along +x (rotation vectors in
+        # manifold3d are DEGREES, not radians). The end caps sit INSIDE the
+        # sphere — capsule construction — so every union is clean: no
+        # coincident caps, no sliver faces, watertight result. The leg bottom
+        # is flush with the rod end (z = -Le).
+        r = d / 2.0
         hb = hook_leg(spec)
-        leg = m3d.Manifold.cylinder(hb, d / 2.0, circular_segments=segs)
-        leg = leg.rotate((0.0, math.pi / 2.0, 0.0))   # rotation vector: +90° about y maps +z onto +x
-        mans.append(leg.translate((0.0, 0.0, -Le + d / 2.0)))
+        z_c = -Le + r                          # bend centre = leg axis
+        mans.pop()                             # full-length rod replaced below
+        mans.append(m3d.Manifold.cylinder(e - z_c, d / 2.0,
+                                          circular_segments=segs)
+                    .translate((0.0, 0.0, z_c)))
+        mans.append(m3d.Manifold.sphere(r, segs).translate((0.0, 0.0, z_c)))
+        mans.append(m3d.Manifold.cylinder(hb, d / 2.0,
+                                          circular_segments=segs)
+                    .rotate((0.0, 90.0, 0.0))   # +z -> +x
+                    .translate((0.0, 0.0, z_c)))
     elif typ == "2":
         side, t = plate_dims(spec)
-        plate = m3d.Manifold.cube([side, side, t]).translate((0.0, 0.0, -Le + t / 2.0))
-        mans.append(plate)
+        # center=True: manifold3d cubes default to the first octant (a corner
+        # at the origin) — without it the plate sits off-axis (issue found in
+        # the live model).
+        plate = m3d.Manifold.cube([side, side, t], True)
+        mans.append(plate.translate((0.0, 0.0, -Le + t / 2.0)))
     elif typ == "4":
         washer = m3d.CrossSection([_circle_pts(d2 / 2.0, segs),
                                    _circle_pts(d1 / 2.0, segs)]).extrude(h_w)
@@ -179,8 +205,18 @@ def anchor_mesh(spec):
     mans.append(washer)
     mans.append(nut.translate((0.0, 0.0, h_w)))
 
-    one = mans[0] if len(mans) == 1 else \
+    return mans[0] if len(mans) == 1 else \
         m3d.Manifold.batch_boolean(mans, m3d.OpType.Add)
+
+
+def anchor_mesh(spec):
+    """Watertight anchor in LOCAL bolt space: the mounting surface is z = 0,
+    the rod runs up to ``z = +e`` (projection) and down to ``z = -(L - e)``
+    (type 1 ends in a horizontal hook leg, flush at the bottom). Placement
+    (translation, hook rotation, up/down flip) lives in the group's xform —
+    the mesh itself is never re-baked."""
+    from core import solids
+    one = _anchor_manifold(spec)
     if one.volume() <= 1e-12:
         raise ValueError(tr("объединение анкера не удалось"))
     sources = solids._Sources()
