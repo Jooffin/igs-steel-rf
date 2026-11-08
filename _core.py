@@ -511,6 +511,61 @@ class SteelSession:
                 pass
         return True
 
+    # -- anchor bolts -----------------------------------------------------------
+    def open_anchors(self):
+        from ._anchors import AnchorDialog, AnchorTool
+
+        def apply(spec):
+            if not self._guard(tr("Закройте редактируемую группу, прежде чем ставить анкеры.")):
+                return
+            self.app.viewport.set_active_tool(AnchorTool(spec, self.apply_anchor))
+        self._kept_dialog("anchors", lambda: AnchorDialog(self.app.window, on_apply=apply))
+
+    def apply_anchor(self, point, spec):
+        """Drop one anchor group at a snapped world point. The mesh is built
+        once in bolt space (surface at z=0, rod up); the point, the hook
+        rotation and the up/down flip live in the group's xform."""
+        if not self._guard(tr("Закройте редактируемую группу, прежде чем ставить анкеры.")):
+            return False
+        from ._anchors import anchor_mesh, anchor_label
+        from core.group import Group
+        from PySide6.QtGui import QMatrix4x4
+        from core.layers import layer_of
+        name = anchor_label(spec)
+        try:
+            mesh = anchor_mesh(spec)
+        except Exception as exc:
+            log.exception("igz_steel_rf: anchor mesh failed")
+            QMessageBox.critical(self.app.window, tr("Сталь РФ"), tr("Не удалось построить анкер: {exc}").format(exc=exc))
+            return False
+        ag = Group(mesh=mesh, name=name)
+        m = QMatrix4x4()
+        m.translate(float(point[0]), float(point[1]), float(point[2]))
+        m.rotate(float(spec.get("az", 0.0)), 0.0, 0.0, 1.0)
+        if spec.get("down"):
+            m.rotate(180.0, 1.0, 0.0, 0.0)
+        ag.xform = m
+        ag.component = False
+        ag.ifc = {"class": "IfcMechanicalFastener", "name": name}
+        ag.ext = {KEY: {"anchor": dict(spec)}}
+        layer = "Layer 0"
+        try:
+            layer = layer_of(self.single_selected()) if self.single_selected() else "Layer 0"
+        except Exception:
+            layer = "Layer 0"
+        err = run(self.app.viewport, insert_command(ag, layer))
+        if err:
+            QMessageBox.critical(self.app.window, tr("Сталь РФ"), err)
+            return False
+        flash = getattr(self.app.viewport, "flash_status", None)
+        if callable(flash):
+            try:
+                flash(tr("Установлен {name} — ещё клик ставит следующий, Esc — выход").format(name=name), 3000)
+            except Exception:
+                pass
+        self._refresh_bom()
+        return True
+
     # -- trim by another member --------------------------------------------------
     def open_trims(self):
         if not self._guard(tr("Закройте редактируемую группу, прежде чем обрезать профиль.")):
@@ -926,6 +981,30 @@ class SteelSession:
                                     "weight_kg": vol * 7850.0,
                                     "layer": layer, "ifc_class": ifc_cls,
                                     "uid": uid})
+            elif "anchor" in block:
+                a = block["anchor"]
+                layer = layer_of(g)
+                ifc_cls = ((g.ifc or {}).get("class", "")
+                           if isinstance(g.ifc, dict) else "")
+                uid = getattr(g, "uid", id(g))
+                from ._anchors import anchor_parts
+                try:
+                    parts = anchor_parts(a)
+                except Exception:
+                    parts = None
+                if parts is None:
+                    try:
+                        vol = face_set_volume(g.mesh.faces)
+                    except Exception:
+                        vol = 0.0
+                    parts = [(f"Анкер {a.get('size', '')}", vol, 1)]
+                    parts = [(lbl, vol * 7850.0, q) for (lbl, vol, q) in parts]
+                for label, mass, qty in parts:
+                    for _q in range(qty):
+                        records.append({"label": label, "kind": "Крепёж",
+                                        "family": "Анкеры", "length_m": 0.0,
+                                        "weight_kg": mass, "layer": layer,
+                                        "ifc_class": ifc_cls, "uid": uid})
         return collect(records)
 
     def select_uid(self, uid):
@@ -1015,6 +1094,18 @@ class SteelSession:
             untrim.triggered.connect(_deferred(lambda g=steel[0]: self.remove_trims(g)))
 
     def outliner_kind(self, group):
+        block = (getattr(group, "ext", None) or {}).get(KEY)
+        if isinstance(block, dict) and "anchor" in block:
+            a = block["anchor"]
+            from core.layers import layer_of
+            from ._anchors import TYPES
+            tlabel = dict(TYPES).get(str(a.get("type")), str(a.get("type")))
+            return {"type": tr("Анкерный болт"),
+                    "props": [(tr("Размер"), str(a.get("size", ""))),
+                              (tr("Тип"), tr(tlabel)),
+                              (tr("Длина"), fmt_len(float(a.get("L", 0.0)))),
+                              (tr("Выступ"), fmt_len(float(a.get("e", 0.0)))),
+                              (tr("Слой"), layer_of(group))]}
         if not is_steel_group(group):
             return None
         p = member_params(group) or {}
@@ -1064,6 +1155,7 @@ def _install_toolbar(app, session):
                ("tb_cuts", tr("Обрезать конец под углом…"), session.open_cuts),
                ("tb_trims", tr("Обрезать профиль по другому профилю…"), session.open_trims),
                ("tb_bolts", tr("Болты в отверстия на конце профиля…"), session.open_bolts),
+               ("tb_anchor", tr("Анкерные болты…"), session.open_anchors),
                ("tb_plates", tr("Пластина на конце профиля…"), session.open_plates),
                ("tb_plate_holes", tr("Отверстия в пластине…"), session.open_plate_holes),
                ("tb_bom", tr("Ведомость стали…"), session.open_bom),
@@ -1104,6 +1196,7 @@ def setup(app):
                          (tr("Обрезать конец под углом…"), session.open_cuts),
                          (tr("Обрезать профиль по другому…"), session.open_trims),
                          (tr("Болты в отверстия…"), session.open_bolts),
+                         (tr("Анкерные болты…"), session.open_anchors),
                          (tr("Пластина на конце профиля…"), session.open_plates),
                          (tr("Отверстия в пластине…"), session.open_plate_holes),
                          (tr("Ведомость стали…"), session.open_bom),
